@@ -1,0 +1,27 @@
+把「月记」装到手机上（安卓 · 荣耀）—— GitHub Pages 版
+
+本文件夹已有：
+  index.html            应用
+  manifest.webmanifest  应用清单（Chrome 里显示"安装应用"）
+  sw.js                 离线缓存（断网也能开）
+  icons/                图标
+  .nojekyll             给 GitHub Pages 用
+
+【上传到 GitHub Pages】
+1. github.com 新建仓库，名字如 yueji，选 Public
+2. Add file → Upload files → 把本文件夹里所有文件拖进去
+   （注意：是文件，不是文件夹；icons 文件夹要一起拖，或先建好 icons 再传图）
+3. Commit changes
+4. Settings → Pages → Build and deployment
+   Source: Deploy from a branch
+   Branch: main / (root) → Save
+5. 等 1~2 分钟，得到 https://你的用户名.github.io/yueji/
+
+【手机上安装】
+1. 手机 Chrome 打开上面的网址
+2. 右上角 ⋮ → 「安装应用」（没有的话找「添加到主屏幕」）
+3. 桌面出现「月记」图标，点开是独立窗口，没有地址栏
+
+【数据】
+只存在手机 Chrome 的这个网址下。服务器只放程序，不存你的账。
+每月「我的」→ 导出备份。换网址 = 换数据空间。
