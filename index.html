@@ -1244,17 +1244,159 @@ html[data-theme="dark"] .warnbar { background: #3a2a0c; color: #fcd34d; border-c
 
   var END_WORDS = ['总计', '合计', '共', '说明', '温馨提示', '本账单', '导出时间'];
 
+  /* ---------------- xlsx 解析（微信新版「用于个人对账」只给 xlsx） ----------------
+   * xlsx 本质是 ZIP + XML，这里手写最小实现：
+   *   1. 读 ZIP 中央目录，按名字取条目
+   *   2. deflate-raw 用浏览器内置 DecompressionStream 解压（无需第三方库、不联网）
+   *   3. 解析 sharedStrings.xml 与 sheet1.xml，转成二维字符串数组
+   * 之后交给 parseBillRows，与 CSV 走同一套分类逻辑。
+   */
+  function parseExcelDate(v) {
+    var s = String(v == null ? '' : v).trim();
+    if (!/^\d+(\.\d+)?$/.test(s)) return null;
+    var n = Number(s);
+    if (!(n > 20000 && n < 80000)) return null;
+    var d = new Date(Math.round((n - 25569) * 86400000));
+    if (isNaN(d.getTime())) return null;
+    return d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate()) + ' ' +
+      pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes()) + ':' + pad2(d.getUTCSeconds());
+  }
+
+  function xmlText(s) {
+    return String(s == null ? '' : s)
+      .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+      .replace(/&#x([0-9a-fA-F]+);/g, function (_, h) { return String.fromCodePoint(parseInt(h, 16)); })
+      .replace(/&#(\d+);/g, function (_, d) { return String.fromCodePoint(parseInt(d, 10)); })
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  }
+
+  function unzipIndex(buf) {
+    var u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    var eocd = -1;
+    var min = Math.max(0, u8.length - 66000);
+    for (var i = u8.length - 22; i >= min; i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error('这不是有效的 xlsx 文件（缺少 ZIP 结构）');
+    var count = dv.getUint16(eocd + 10, true);
+    var cdOff = dv.getUint32(eocd + 16, true);
+    var map = {};
+    var p = cdOff;
+    for (var n = 0; n < count; n++) {
+      if (p + 46 > u8.length || dv.getUint32(p, true) !== 0x02014b50) break;
+      var method = dv.getUint16(p + 10, true);
+      var compSize = dv.getUint32(p + 20, true);
+      var nameLen = dv.getUint16(p + 28, true);
+      var extraLen = dv.getUint16(p + 30, true);
+      var commentLen = dv.getUint16(p + 32, true);
+      var localOff = dv.getUint32(p + 42, true);
+      var name = new TextDecoder('utf-8').decode(u8.subarray(p + 46, p + 46 + nameLen));
+      if (localOff + 30 <= u8.length) {
+        var lnameLen = dv.getUint16(localOff + 26, true);
+        var lextraLen = dv.getUint16(localOff + 28, true);
+        map[name] = { method: method, compSize: compSize, dataOff: localOff + 30 + lnameLen + lextraLen };
+      }
+      p += 46 + nameLen + extraLen + commentLen;
+    }
+    return { u8: u8, map: map };
+  }
+
+  function inflateRaw(u8) {
+    if (typeof DecompressionStream === 'undefined') {
+      return Promise.reject(new Error('这个浏览器太旧，解不开 xlsx。请用新版 Chrome / Edge / Safari，或把账单另存为 CSV。'));
+    }
+    var stream = new Blob([u8]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return new Response(stream).arrayBuffer().then(function (ab) { return new Uint8Array(ab); });
+  }
+
+  function readZipText(zip, name) {
+    var e = zip.map[name];
+    if (!e) return Promise.resolve(null);
+    var raw = zip.u8.subarray(e.dataOff, e.dataOff + e.compSize);
+    var p = e.method === 0 ? Promise.resolve(raw) : inflateRaw(raw);
+    return p.then(function (bytes) { return new TextDecoder('utf-8').decode(bytes); });
+  }
+
+  function readSharedStrings(xml) {
+    var out = [];
+    if (!xml) return out;
+    var re = /<si\b[^>]*>([\s\S]*?)<\/si>/g, m;
+    while ((m = re.exec(xml))) {
+      var parts = [], tre = /<t\b[^>]*>([\s\S]*?)<\/t>/g, t;
+      while ((t = tre.exec(m[1]))) parts.push(xmlText(t[1]));
+      out.push(parts.join(''));
+    }
+    return out;
+  }
+
+  function colIndex(ref) {
+    var m = /^\$?([A-Z]+)/i.exec(String(ref || ''));
+    if (!m) return -1;
+    var s = m[1].toUpperCase(), n = 0;
+    for (var i = 0; i < s.length; i++) n = n * 26 + (s.charCodeAt(i) - 64);
+    return n - 1;
+  }
+
+  function readSheetRows(xml, shared) {
+    var rows = [];
+    var rre = /<row\b[^>]*>([\s\S]*?)<\/row>/g, rm;
+    while ((rm = rre.exec(xml))) {
+      var body = rm[1];
+      var arr = [];
+      var cre = /<c\b([^>]*)>([\s\S]*?)<\/c>/g, cm;
+      while ((cm = cre.exec(body))) {
+        var attrs = cm[1] || '', inner = cm[2] || '';
+        var refM = /r="([^"]+)"/.exec(attrs);
+        var ci = refM ? colIndex(refM[1]) : arr.length;
+        if (ci < 0) ci = arr.length;
+        var tM = /t="([^"]+)"/.exec(attrs);
+        var type = tM ? tM[1] : '';
+        var val = '';
+        if (type === 's') {
+          var vm = /<v[^>]*>([\s\S]*?)<\/v>/.exec(inner);
+          val = vm ? (shared[Number(vm[1])] || '') : '';
+        } else if (type === 'inlineStr') {
+          var t2 = /<t[^>]*>([\s\S]*?)<\/t>/.exec(inner);
+          val = t2 ? xmlText(t2[1]) : '';
+        } else {
+          var vm2 = /<v[^>]*>([\s\S]*?)<\/v>/.exec(inner);
+          val = vm2 ? xmlText(vm2[1]) : '';
+        }
+        arr[ci] = val;
+      }
+      for (var k = 0; k < arr.length; k++) if (arr[k] == null) arr[k] = '';
+      rows.push(arr);
+    }
+    return rows;
+  }
+
+  /** xlsx Buffer/ArrayBuffer → 二维数组（异步，因为要解压） */
+  function xlsxRows(buf) {
+    var zip;
+    try { zip = unzipIndex(buf); } catch (e) { return Promise.reject(e); }
+    return readZipText(zip, 'xl/sharedStrings.xml').then(function (ssXml) {
+      var shared = readSharedStrings(ssXml);
+      var sheet = null;
+      Object.keys(zip.map).forEach(function (n) {
+        if (!sheet && /^xl\/worksheets\/sheet\d+\.xml$/.test(n)) sheet = n;
+      });
+      if (!sheet) return Promise.reject(new Error('xlsx 里没有找到工作表'));
+      return readZipText(zip, sheet).then(function (xml) { return readSheetRows(xml, shared); });
+    });
+  }
+
   /**
    * 解析一份账单文本。
    * @param {string} text CSV 原文
    * @param {{platform?:string, mapping?:Object}} [opts]
    * @returns {{ok:boolean, platform:string, items:Array, skipped:Array, warnings:Array, header:Array, rows:Array}}
    */
-  function parseBill(text, opts) {
+  function parseBillRows(rows, opts, hintText) {
     opts = opts || {};
-    var src = String(text || '').replace(/^\uFEFF/, '');
-    var platform = opts.platform && opts.platform !== 'auto' ? opts.platform : detectPlatform(src);
-    var rows = parseCSV(src);
+    rows = rows || [];
+    var platform = opts.platform && opts.platform !== 'auto' ? opts.platform : detectPlatform(hintText || rows.map(function (r) { return r.join(' '); }).join('\n'));
     var warnings = [];
 
     if (!rows.length) return { ok: false, platform: platform, items: [], skipped: [], warnings: ['文件是空的'], header: [], rows: [] };
@@ -1263,7 +1405,7 @@ html[data-theme="dark"] .warnbar { background: #3a2a0c; color: #fcd34d; border-c
     if (hi < 0) {
       return {
         ok: false, platform: platform, items: [], skipped: [], header: [], rows: rows,
-        warnings: ['没有找到表头（需要同时包含「交易时间」和「金额」两列）。请确认导出的是 CSV 而不是 Excel/PDF。']
+        warnings: ['没有找到表头（需要同时包含「交易时间」和「金额」两列）。请确认导出的是账单文件，而不是 PDF。']
       };
     }
 
@@ -1287,6 +1429,7 @@ html[data-theme="dark"] .warnbar { background: #3a2a0c; color: #fcd34d; border-c
       if (isEnd) break;
 
       var ts = col.time >= 0 ? parseTime(r[col.time]) : null;
+      if (ts == null && col.time >= 0) ts = parseTime(parseExcelDate(r[col.time]) || '');
       var amt = parseAmount(r[col.amount]);
       if (ts == null || amt == null) {
         if (r.some(function (c) { return String(c).trim(); })) skipped.push({ row: i + 1, reason: '时间或金额无法识别', raw: r.join(' | ').slice(0, 120) });
@@ -1347,6 +1490,19 @@ html[data-theme="dark"] .warnbar { background: #3a2a0c; color: #fcd34d; border-c
     if (!items.length) warnings.push('没有解析出可用记录（可能这份账单是空的，或者列名和常见格式不同）。');
 
     return { ok: items.length > 0, platform: platform, items: items, skipped: skipped, warnings: warnings, header: header, rows: rows, col: col, headerIndex: hi };
+  }
+
+  /** CSV 文本 → 解析结果 */
+  function parseBill(text, opts) {
+    var src = String(text || '').replace(/^\uFEFF/, '');
+    return parseBillRows(parseCSV(src), opts, src);
+  }
+
+  /** xlsx → 解析结果（微信新版「用于个人对账」账单） */
+  function parseXlsx(buf, opts) {
+    return xlsxRows(buf).then(function (rows) {
+      return parseBillRows(rows, opts, rows.map(function (r) { return r.join(' '); }).join('\n'));
+    });
   }
 
   /**
@@ -1587,6 +1743,9 @@ html[data-theme="dark"] .warnbar { background: #3a2a0c; color: #fcd34d; border-c
     isNonSpendRow: isNonSpendRow,
     parseCSV: parseCSV,
     parseBill: parseBill,
+    parseBillRows: parseBillRows,
+    parseXlsx: parseXlsx,
+    xlsxRows: xlsxRows,
     detectColumn: detectColumn,
     parseAmount: parseAmount,
     parseTime: parseTime,
@@ -2329,7 +2488,7 @@ html[data-theme="dark"] .warnbar { background: #3a2a0c; color: #fcd34d; border-c
 
     html += '<div class="section-t">数据</div>';
     html += '<div class="card set-group">';
-    html += '<button class="set-row" data-act="import"><span class="ic">📥</span><div class="tx-mid"><div class="tt">导入支付宝 / 微信账单</div><div class="dd">导出 CSV 后拖进来，自动分类</div></div><span class="chev">›</span></button>';
+    html += '<button class="set-row" data-act="import"><span class="ic">📥</span><div class="tx-mid"><div class="tt">导入支付宝 / 微信账单</div><div class="dd">CSV / xlsx 直接拖进来，自动分类</div></div><span class="chev">›</span></button>';
     html += '<button class="set-row" data-act="report"><span class="ic">🧾</span><div class="tx-mid"><div class="tt">生成这个月的月报</div><div class="dd">一段可以直接发朋友圈 / 发给自己的总结</div></div><span class="chev">›</span></button>';
     html += '<button class="set-row" data-act="export-csv"><span class="ic">📄</span><div class="tx-mid"><div class="tt">导出 CSV（给 Excel 用）</div><div class="dd">带分类、月份，可以直接做透视表</div></div><span class="chev">›</span></button>';
     html += '<button class="set-row" data-act="export-json"><span class="ic">💾</span><div class="tx-mid"><div class="tt">导出备份</div><div class="dd">换手机、换浏览器时用它恢复</div></div><span class="chev">›</span></button>';
@@ -2628,38 +2787,56 @@ html[data-theme="dark"] .warnbar { background: #3a2a0c; color: #fcd34d; border-c
     return '<div class="import-step">' +
       '<div style="font-weight:700;font-size:14px;margin-bottom:8px"><span class="step-num">1</span>导出账单（只需做一次/每月一次）</div>' +
       '<div class="card pad small" style="line-height:1.95;color:var(--ink-2)">' +
-      '<b>支付宝</b>：我的 → 账单 → 右上角 … → 开具交易流水证明 / 账单导出 → 选「用于个人对账」→ 邮箱收到 <b>CSV</b> 压缩包。<br>' +
-      '<b>微信</b>：我 → 服务 → 钱包 → 账单 → 右上角 … → 账单下载 → 「用于个人对账」→ 邮箱收到 CSV。<br>' +
-      '<span class="muted tiny">只支持 CSV。手机端把文件保存到「文件」App，再从这里选；电脑上直接拖进来。</span>' +
+      '<b>支付宝</b>：我的 → 账单 → 右上角 … → 开具交易流水证明 / 账单导出 → 选「用于个人对账」→ 邮箱收到压缩包（CSV）。<br>' +
+      '<b>微信</b>：我 → 服务 → 钱包 → 账单 → 右上角 … → 账单下载 → 「用于个人对账」→ 邮箱收到的可能是 <b>xlsx</b>。<br>' +
+      '<span class="muted tiny">CSV 和 xlsx 都支持，直接选文件即可。手机端把文件保存到「文件」App，再从这里选；电脑上直接拖进来。</span>' +
       '</div></div>' +
       '<div class="import-step"><div style="font-weight:700;font-size:14px;margin-bottom:8px"><span class="step-num">2</span>选文件</div>' +
       '<label class="drop" for="fileInput" style="display:block">' +
-      '<div class="ic">📄</div><div class="t">点这里选 CSV 文件</div>' +
-      '<div class="d">支付宝 / 微信 / 其他记账 App 导出的都行</div></label>' +
-      '<input type="file" id="fileInput" accept=".csv,.txt,text/csv" class="hide">' +
-      '<div class="tiny muted" style="margin-top:10px;text-align:center">解析只在本机进行，文件不会上传</div>' +
+      '<div class="ic">📄</div><div class="t">点这里选账单文件</div>' +
+      '<div class="d">CSV 或 xlsx（支付宝 / 微信 / 其他记账 App 都行）</div></label>' +
+      '<input type="file" id="fileInput" accept=".csv,.txt,.xlsx" class="hide">' +
+      '<div class="tiny muted" style="margin-top:10px;text-align:center">支持 CSV / xlsx · 解析只在本机进行，文件不会上传</div>' +
       '<div style="text-align:center;margin-top:10px"><button class="chip" data-act="import-demo">先用示例账单试试 →</button></div>' +
       '</div>';
   }
 
+  /** 统一入口：ArrayBuffer + 文件名 → 解析 → 渲染预览 */
+  function loadBuffer(buf, name) {
+    importState.fileName = name || '';
+    if (/\.xlsx$/i.test(name || '')) {
+      return C.parseXlsx(buf, { platform: importState.platform }).then(function (p) {
+        importState.parsed = p;
+        renderPreview();
+        return p;
+      }, function (err) {
+        importState.parsed = {
+          ok: false, platform: 'generic', items: [], skipped: [],
+          warnings: [err && err.message ? err.message : 'xlsx 解析失败'], header: [], rows: []
+        };
+        renderPreview();
+        return importState.parsed;
+      });
+    }
+    var text = decodeBuffer(buf, 'utf-8');
+    if (text.indexOf('\uFFFD') >= 0 && importState.encoding !== 'manual') {
+      var gbk = decodeBuffer(buf, 'gbk');
+      if (gbk && gbk.indexOf('\uFFFD') < 0) { text = gbk; importState.encoding = 'gbk'; }
+    }
+    importState.payload = text;
+    importState.parsed = C.parseBill(text, { platform: importState.platform });
+    renderPreview();
+    return Promise.resolve(importState.parsed);
+  }
+
   function readFile(file) {
-    importState.fileName = file.name;
-    if (/.(xlsx|xls)$/i.test(file.name)) {
-      toast('Excel 文件读不了，请先「另存为 CSV」再导入');
+    if (/\.xls$/i.test(file.name)) {
+      toast('旧版 .xls 读不了：请用 Excel/WPS 另存为 .xlsx 或 CSV');
       return;
     }
+    importState.fileName = file.name;
     var reader = new FileReader();
-    reader.onload = function (e) {
-      var buf = e.target.result;
-      var text = decodeBuffer(buf, 'utf-8');
-      if (text.indexOf('\uFFFD') >= 0 && importState.encoding !== 'manual') {
-        var gbk = decodeBuffer(buf, 'gbk');
-        if (gbk && gbk.indexOf('\uFFFD') < 0) { text = gbk; importState.encoding = 'gbk'; }
-      }
-      importState.payload = text;
-      importState.parsed = C.parseBill(text, { platform: importState.platform });
-      renderPreview();
-    };
+    reader.onload = function (e) { loadBuffer(e.target.result, file.name); };
     reader.readAsArrayBuffer(file);
   }
 
@@ -3660,6 +3837,8 @@ html[data-theme="dark"] .warnbar { background: #3a2a0c; color: #fcd34d; border-c
     state: state, go: go, openSheet: openSheet, loadDemo: loadDemo,
     addDemo: function () { bootDemo(builtinDemo()); },
     exportCSV: exportCSV,
+    // 自测/调试：直接把 ArrayBuffer 送进导入流程（xlsx 或 csv）
+    importBuffer: function (buf, name) { openImport(); return loadBuffer(buf, name); },
     // 调试/自测用：把内置示例账单直接送进导入预览
     demoImport: function () {
       openImport();
